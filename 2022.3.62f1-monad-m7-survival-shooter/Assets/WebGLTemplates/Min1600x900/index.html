@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>{{{ PRODUCT_NAME }}}</title>
+
+  <style>
+    :root {
+      --bg: #0b0b0d;
+      --text: #e6e6e6;
+      --muted: #9aa0a6;
+      --bar: #4caf50;      /* progress fill */
+      --bar-bg: #2a2a2a;   /* progress track */
+      --accent: #8ab4f8;   /* title accent */
+    }
+
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: #000; /* letterbox color around canvas */
+      overflow: hidden;
+      color: var(--text);
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+    }
+
+    /* Canvas container */
+    #unity-container { position: fixed; inset: 0; }
+    #unity-canvas {
+      display: block;
+      position: absolute; /* centered via JS */
+      image-rendering: auto; /* smooth up/downscale */
+      outline: none;
+    }
+    canvas { touch-action: none; }
+
+    /* Loader overlay */
+    #loader {
+      position: fixed;
+      inset: 0;
+      background: var(--bg);
+      display: grid;
+      place-items: center;
+      z-index: 1000;
+      transition: opacity .35s ease;
+    }
+    #loader.hidden { opacity: 0; pointer-events: none; }
+
+    .loader-card {
+      width: min(520px, 90vw);
+      box-sizing: border-box;
+      padding: 28px 24px;
+      border-radius: 16px;
+      background: rgba(255,255,255,0.04);
+      box-shadow: 0 10px 30px rgba(0,0,0,0.5), inset 0 1px 0 rgba(255,255,255,0.03);
+      backdrop-filter: blur(6px);
+    }
+
+    .loader-title {
+      margin: 0 0 4px 0;
+      font-size: 20px;
+      letter-spacing: .2px;
+    }
+    .loader-sub {
+      margin: 0 0 18px 0;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .bar-wrap {
+      width: 100%;
+      height: 14px;
+      background: var(--bar-bg);
+      border-radius: 999px;
+      overflow: hidden;
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,0.06);
+    }
+    .bar {
+      height: 100%;
+      width: 0%;
+      background: var(--bar);
+      transform-origin: left center;
+      transition: width .15s ease;
+    }
+
+    .row {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      margin-top: 10px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .brand {
+      display: inline-flex;
+      gap: 8px;
+      align-items: baseline;
+    }
+    .brand b {
+      color: var(--accent);
+      font-weight: 600;
+      letter-spacing: .3px;
+    }
+
+    .error {
+      margin-top: 12px;
+      color: #ffb4b4;
+      font-size: 12px;
+      display: none;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .has-error .error { display: block; }
+  </style>
+</head>
+
+<body>
+  <!-- Loading overlay -->
+  <div id="loader" role="status" aria-live="polite">
+    <div class="loader-card" aria-label="Loading game">
+      <h1 class="loader-title">
+        <span class="brand"><b>{{{ PRODUCT_NAME }}}</b> is loading…</span>
+      </h1>
+      <p class="loader-sub" id="status">Initializing…</p>
+      <div class="bar-wrap" aria-hidden="true"><div class="bar" id="bar"></div></div>
+      <div class="row">
+        <span id="hint">Tip: keep this tab active for faster compilation.</span>
+        <span id="pct">0%</span>
+      </div>
+      <div class="error" id="err"></div>
+    </div>
+  </div>
+
+  <!-- Canvas holder -->
+  <div id="unity-container">
+    <canvas id="unity-canvas" tabindex="-1"></canvas>
+  </div>
+
+  <!-- Unity loader -->
+  <script src="Build/{{{ LOADER_FILENAME }}}"></script>
+
+  <script>
+    // ====== SETTINGS ======
+    const MIN_W = 1600;
+    const MIN_H = 900;
+    const ASPECT = 16 / 9;
+    const DPR_CAP = 1.25; // HiDPI cap (1 to disable)
+
+    const AUTH_URL = "https://auth.rxmsolutions.com/";
+    const CHECK_WALLET_URL = "https://monad-games-id-site.vercel.app/api/check-wallet?wallet=";
+    const LEADERBOARD_URL = "https://monad-mission7-api.rxmsolutions.com/api/v1/getleaderboard?gameId=64";
+
+    const LEVEL_MIN = { 0: 0, 1: 700, 2: 1200 };
+    const CHAR_MIN  = { 0: 0, 1: 500, 2: 1000 };
+
+    const canvas   = document.getElementById("unity-canvas");
+    const loader   = document.getElementById("loader");
+    const barEl    = document.getElementById("bar");
+    const pctEl    = document.getElementById("pct");
+    const statusEl = document.getElementById("status");
+    const errEl    = document.getElementById("err");
+
+    // Unity build config (placeholders are filled by Unity)
+    const config = {
+      dataUrl: "Build/{{{ DATA_FILENAME }}}",
+      frameworkUrl: "Build/{{{ FRAMEWORK_FILENAME }}}",
+      codeUrl: "Build/{{{ CODE_FILENAME }}}",
+      memoryUrl: "Build/{{{ MEMORY_FILENAME }}}",
+      symbolsUrl: "Build/{{{ SYMBOLS_FILENAME }}}",
+      streamingAssetsUrl: "StreamingAssets",
+      companyName: "{{{ COMPANY_NAME }}}",
+      productName: "{{{ PRODUCT_NAME }}}",
+      productVersion: "{{{ PRODUCT_VERSION }}}",
+      decompressionFallback: true,
+      devicePixelRatio: 1,                 // We'll control buffer size
+      matchWebGLToCanvasSize: false,
+      webglContextAttributes: {
+        alpha: false,
+        antialias: true,
+        preserveDrawingBuffer: false,
+        desynchronized: true,
+        powerPreference: "high-performance"
+      }
+    };
+
+    // ============ Utility: sizing ============
+    function computeCssSize(vw, vh) {
+      const fitByWidth = Math.floor(vw / ASPECT) <= vh;
+      if (fitByWidth) {
+        const w = vw;
+        const h = Math.floor(w / ASPECT);
+        return { w, h };
+      } else {
+        const h = vh;
+        const w = Math.floor(h * ASPECT);
+        return { w, h };
+      }
+    }
+
+    function fitCanvas() {
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      const css = computeCssSize(vw, vh);
+
+      canvas.style.width  = css.w + "px";
+      canvas.style.height = css.h + "px";
+      canvas.style.left   = Math.round((vw - css.w) / 2) + "px";
+      canvas.style.top    = Math.round((vh - css.h) / 2) + "px";
+
+      const smallerThanMin = (vw < MIN_W || vh < MIN_H);
+      if (smallerThanMin) {
+        canvas.width  = MIN_W;
+        canvas.height = MIN_H;
+      } else {
+        const dpr = Math.min(window.devicePixelRatio || 1, DPR_CAP);
+        canvas.width  = Math.round(css.w * dpr);
+        canvas.height = Math.round(css.h * dpr);
+      }
+
+      if (window.unityInstance &&
+          unityInstance.Module &&
+          typeof unityInstance.Module.setCanvasSize === "function") {
+        unityInstance.Module.setCanvasSize(canvas.width, canvas.height);
+      }
+    }
+
+    // Optionally let Unity hide the loader later (after first scene is ready)
+    window.__unity_scene_ready = function() { hideLoader(); };
+
+    function setProgress(p) {
+      const pct = Math.max(0, Math.min(100, Math.round(p * 100)));
+      barEl.style.width = pct + "%";
+      pctEl.textContent = pct + "%";
+
+      if (p < 0.1)      statusEl.textContent = "Preparing files…";
+      else if (p < 0.6) statusEl.textContent = "Downloading assets…";
+      else if (p < 0.9) statusEl.textContent = "Compiling WebAssembly…";
+      else              statusEl.textContent = "Finalizing…";
+    }
+
+    function showError(msg) {
+      loader.classList.add("has-error");
+      errEl.textContent = (msg && ("" + msg)) || "Unknown error.";
+      statusEl.textContent = "Load failed";
+    }
+
+    function hideLoader() {
+      loader.classList.add("hidden");
+      setTimeout(() => loader.setAttribute("aria-hidden", "true"), 400);
+    }
+
+    // ============ Token + access guard ============
+    function log(...a){ console.log("[TokenGuard]", ...a); }
+    function warn(...a){ console.warn("[TokenGuard]", ...a); }
+
+    function redirect(reason) {
+      warn("Redirecting to auth due to:", reason);
+      try { statusEl.textContent = "Redirecting to authentication…"; } catch(e){}
+      window.location.href = AUTH_URL;
+    }
+
+    function getQueryToken() {
+      const sp = new URLSearchParams(window.location.search);
+      return sp.get("token");
+    }
+
+    function base64UrlToJson(str) {
+      try {
+        // If raw JSON was passed (not base64), just parse
+        if (str && str.trim().startsWith("{")) {
+          return JSON.parse(str);
+        }
+        // Normalize Base64URL -> Base64
+        let b64 = (str || "").replace(/-/g, "+").replace(/_/g, "/");
+        while (b64.length % 4) b64 += "=";
+
+        // atob -> string (handle unicode)
+        const bin = atob(b64);
+        // Convert to UTF-8 cleanly
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        const text = new TextDecoder().decode(bytes);
+        return JSON.parse(text);
+      } catch (e) {
+        // last resort for odd encodings
+        try { return JSON.parse(decodeURIComponent(escape(atob(str)))); }
+        catch (_) { throw e; }
+      }
+    }
+
+    function validateAddress(addr) {
+      return typeof addr === "string" && /^0x[a-fA-F0-9]{40}$/.test(addr);
+    }
+
+    function normalizeHex(addr) {
+      return (addr || "").toLowerCase();
+    }
+
+    async function fetchJSON(url, timeoutMs = 10000) {
+      const ctl = new AbortController();
+      const to = setTimeout(() => ctl.abort(), timeoutMs);
+      try {
+        const res = await fetch(url, { signal: ctl.signal, credentials: "omit" });
+        log("HTTP", res.status, url);
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        return await res.json();
+      } finally { clearTimeout(to); }
+    }
+
+    async function guardAccess() {
+      try {
+        statusEl.textContent = "Verifying access…";
+
+        // 1) Parse token
+        const raw = getQueryToken();
+        if (!raw) return redirect("missing token");
+        log("Raw token:", raw.slice(0, 32) + (raw.length > 32 ? "…" : ""));
+
+        let parsed;
+        try { parsed = base64UrlToJson(raw); }
+        catch (e) { return redirect("invalid token (decode/parse failed)"); }
+
+        log("Decoded token:", parsed);
+
+        // 2) Required keys
+        const walletAddress = (parsed.walletAddress ?? parsed.wallet ?? "").trim();
+        const username      = (parsed.username ?? "").trim();
+        const characterStr  = (parsed.character ?? "").toString().trim();
+        const levelStr      = (parsed.level ?? "").toString().trim();
+
+        if (!walletAddress || !username || characterStr === "" || levelStr === "") {
+          return redirect("missing required keys");
+        }
+        if (!validateAddress(walletAddress)) {
+          return redirect("invalid walletAddress format");
+        }
+
+        const character = Number(characterStr);
+        const level = Number(levelStr);
+        if (!Number.isInteger(character) || !(character in CHAR_MIN)) {
+          return redirect("invalid character value");
+        }
+        if (!Number.isInteger(level) || !(level in LEVEL_MIN)) {
+          return redirect("invalid level value");
+        }
+
+        // Expose to Unity if you need it later
+        window.WebGLUrlParams = {
+          walletAddress, username,
+          character: String(character),
+          level: String(level)
+        };
+
+        // 3) Wallet ↔ username check
+        statusEl.textContent = "Checking account…";
+        const checkUrl = CHECK_WALLET_URL + encodeURIComponent(walletAddress);
+        let walletInfo;
+        try {
+          walletInfo = await fetchJSON(checkUrl, 10000);
+        } catch (e) {
+          return redirect("check-wallet request failed");
+        }
+
+        log("check-wallet response:", walletInfo);
+
+        if (!walletInfo || walletInfo.hasUsername !== true || !walletInfo.user) {
+          return redirect("wallet has no username (or invalid response)");
+        }
+
+        const apiUser = walletInfo.user;
+        const walletMatches = normalizeHex(apiUser.walletAddress) === normalizeHex(walletAddress);
+        const usernameMatches = (apiUser.username || "").toLowerCase() === username.toLowerCase();
+
+        if (!walletMatches) return redirect("wallet mismatch");
+        if (!usernameMatches) return redirect("username mismatch");
+
+        // 4) Score minimums (must satisfy both level + character minimums)
+        statusEl.textContent = "Checking score requirements…";
+        let lb;
+        try {
+          lb = await fetchJSON(LEADERBOARD_URL, 10000);
+        } catch (e) {
+          return redirect("leaderboard request failed");
+        }
+
+        log("leaderboard:", lb);
+
+        const scoreRows = Array.isArray(lb?.scoreData) ? lb.scoreData : [];
+        // Prefer wallet match; fallback to username if needed
+        const me = scoreRows.find(r =>
+          normalizeHex(r.walletAddress) === normalizeHex(walletAddress)
+        ) || scoreRows.find(r => (r.username || "").toLowerCase() === username.toLowerCase());
+
+        const score = me ? Number(me.score) : 0;
+        log(`Found score=${score} for user=${username} wallet=${walletAddress}`);
+
+        const needLevel = LEVEL_MIN[level];
+        const needChar  = CHAR_MIN[character];
+        const needBothSatisfied = (score >= needLevel) && (score >= needChar);
+        log(`Required: level>=${needLevel}, character>=${needChar}; satisfied=${needBothSatisfied}`);
+
+        if (!needBothSatisfied) {
+          return redirect("insufficient points for chosen level/character");
+        }
+
+        // Passed all checks
+        log("Access ok — starting Unity…");
+        return true;
+      } catch (e) {
+        warn("Unexpected guard error:", e);
+        return redirect("unexpected error");
+      }
+    }
+
+    // ============ Boot Unity only after guard ============
+    let unityInstance = null;
+
+    function boot() {
+      fitCanvas();
+
+      createUnityInstance(canvas, config, (progress) => {
+        setProgress(progress);
+      }).then((instance) => {
+        unityInstance = instance;
+        fitCanvas();
+        window.addEventListener("resize", fitCanvas);
+        window.addEventListener("orientationchange", fitCanvas);
+        document.addEventListener("fullscreenchange", fitCanvas);
+
+        setTimeout(() => hideLoader(), 150);
+      }).catch((err) => {
+        console.error("Unity load failed:", err);
+        showError(err && (err.message || err));
+      });
+    }
+
+    async function start() {
+      // Run the guard first; if it returns true, continue; otherwise we've redirected
+      const ok = await guardAccess();
+      if (ok === true) {
+        boot();
+      } else {
+        // guardAccess already redirected; keep loader visible until navigation
+        log("Blocked — navigation to auth should follow.");
+      }
+    }
+
+    if (document.readyState === "loading") {
+      window.addEventListener("load", start);
+    } else {
+      start();
+    }
+  </script>
+</body>
+</html>

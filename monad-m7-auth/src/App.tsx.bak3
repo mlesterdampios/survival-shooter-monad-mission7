@@ -1,0 +1,677 @@
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import {
+  usePrivy,
+  useCrossAppAccounts,
+  useUser,
+  type CrossAppAccountWithMetadata,
+} from '@privy-io/react-auth'
+
+type CheckWalletResponse = {
+  hasUsername: boolean
+  user?: { id: number; username: string; walletAddress: string }
+}
+
+// --- Leaderboard types ---
+type ScoreRow = {
+  userId: number
+  username: string
+  walletAddress: string
+  score: number
+  gameId: number
+  gameName: string
+  rank: number
+}
+
+type LeaderboardResponse = {
+  ok: boolean
+  gameId: number
+  gameName: string
+  lastUpdated: string | null
+  scorePagination: { page: number; limit: number; total: string; totalPages: number }
+  transactionPagination: { page: number; limit: number; total: string; totalPages: number }
+  scoreData: ScoreRow[]
+  transactionData: unknown[]
+  source?: { url: string; fetchedAt: string }
+}
+
+const GAME_ID = 64
+
+// Base64URL (Unicode-safe)
+function base64url(str: string): string {
+  const utf8 = new TextEncoder().encode(str)
+  let binary = ''
+  for (let i = 0; i < utf8.length; i++) binary += String.fromCharCode(utf8[i])
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '')
+}
+
+// --- Character catalogue (thresholds and display) ---
+type CharacterKey = '0' | '1' | '2'
+
+const CHAR_THRESHOLDS: Record<CharacterKey, number> = {
+  '0': 0,     // Default
+  '1': 500,   // Sharp shooter
+  '2': 1000,  // Alien
+}
+
+// PARAPHRASED character descriptions
+const CHAR_META: Record<CharacterKey, {
+  name: string
+  desc: string
+  img: string
+}> = {
+  '0': {
+    name: 'Default',
+    desc: 'Shots spread more while moving. Fires every 0.25s. Slow movement speed. 10 damage per hit.',
+    img: '/characters/default.png',
+  },
+  '1': {
+    name: 'Sharp shooter',
+    desc: 'Stable aim even on the run. 0.15s firing cadence. Average movement speed. 10 damage per hit.',
+    img: '/characters/sharp.png',
+  },
+  '2': {
+    name: 'Alien',
+    desc: 'Pinpoint accuracy while sprinting. One shot per second. Fast movement speed. 100 damage per hit.',
+    img: '/characters/alien.png',
+  },
+}
+
+// --- Level catalogue (thresholds and display) ---
+type LevelKey = '0' | '1' | '2'
+
+const LEVEL_THRESHOLDS: Record<LevelKey, number> = {
+  '0': 0,     // Urban
+  '1': 700,   // Stadium
+  '2': 1200,  // Nightmare Dream
+}
+
+// PARAPHRASED level descriptions
+const LEVEL_META: Record<LevelKey, {
+  name: string
+  desc: string
+  img: string
+}> = {
+  '0': {
+    name: 'Urban',
+    desc: 'Enemies hit lightly and rewards per takedown are modest.',
+    img: '/levels/level0.png',
+  },
+  '1': {
+    name: 'Stadium',
+    desc: 'Incoming damage is moderate and points per kill are mid-tier.',
+    img: '/levels/level1.png',
+  },
+  '2': {
+    name: 'Nightmare Dream',
+    desc: 'Foes strike hard, but each elimination yields high scores.',
+    img: '/levels/level2.png',
+  },
+}
+
+export default function App() {
+  const { ready, authenticated, user, login, logout } = usePrivy()
+  const { linkCrossAppAccount } = useCrossAppAccounts()
+  const { refreshUser } = useUser()
+
+  // ⚠️ Provider app’s Privy App ID (Monad Games ID)
+  const providerAppId = useMemo(
+    () =>
+      (import.meta.env.VITE_PROVIDER_APP_ID as string | undefined) ??
+      'cmd8euall0037le0my79qpz42',
+    []
+  )
+
+  const redirectBase = useMemo(
+    () =>
+      (import.meta.env.VITE_REDIRECT_BASE as string | undefined) ??
+      'https://monad-mission7.rxmsolutions.com',
+    []
+  )
+
+  const [walletAddress, setWalletAddress] = useState<string | null>(null)
+  const [username, setUsername] = useState<string | null>(null)
+  const [hasUsername, setHasUsername] = useState<boolean | null>(null)
+  const [message, setMessage] = useState<string | null>(null)
+  const [checking, setChecking] = useState(false)
+  const [needsProviderSetup, setNeedsProviderSetup] = useState(false)
+
+  // Leaderboard / score
+  const [score, setScore] = useState<number | null>(null)
+  const [loadingScore, setLoadingScore] = useState(false)
+  const [scoreError, setScoreError] = useState<string | null>(null)
+
+  // Character + Level selection
+  const [selectedCharacter, setSelectedCharacter] = useState<CharacterKey>('0')
+  const [selectedLevel, setSelectedLevel] = useState<LevelKey>('0')
+
+  const findCrossAppAccount = useCallback(() => {
+    const xapp = (user?.linkedAccounts ?? []).find(
+      (a): a is CrossAppAccountWithMetadata =>
+        a.type === 'cross_app' && a.providerApp?.id === providerAppId
+    )
+    return xapp
+  }, [user, providerAppId])
+
+  const checkWallet = useCallback(async (addr: string) => {
+    setChecking(true)
+    setMessage('Checking wallet…')
+    try {
+      const res = await fetch(
+        `https://monad-games-id-site.vercel.app/api/check-wallet?wallet=${encodeURIComponent(
+          addr
+        )}`
+      )
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const data: CheckWalletResponse = await res.json()
+
+      setHasUsername(!!data.hasUsername)
+      if (data.hasUsername && data.user?.username) {
+        setUsername(data.user.username)
+        setMessage(`Welcome, ${data.user.username}!`)
+      } else {
+        setUsername(null)
+        setMessage('No username yet. Set one on Monad Games ID, then click “Re-check username.”')
+      }
+    } catch {
+      setMessage('Failed to check wallet. Please try again.')
+    } finally {
+      setChecking(false)
+    }
+  }, [])
+
+  // Fetch your score from the leaderboard API
+  const fetchScoreForWallet = useCallback(
+    async (addr: string) => {
+      setLoadingScore(true)
+      setScoreError(null)
+      try {
+        const res = await fetch(
+          `https://monad-mission7-api.rxmsolutions.com/api/v1/getleaderboard?gameId=${GAME_ID}`
+        )
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        const data: LeaderboardResponse = await res.json()
+
+        // match by wallet (primary)
+        let yourScore = data.scoreData.find(
+          row => row.walletAddress.toLowerCase() === addr.toLowerCase()
+        )?.score
+
+        // fallback: match by username if we have one
+        if (yourScore == null && username) {
+          const uname = username.toLowerCase()
+          yourScore = data.scoreData.find(
+            row => row.username.toLowerCase() === uname
+          )?.score
+        }
+
+        setScore(yourScore ?? 0)
+      } catch {
+        setScoreError('Could not load leaderboard. Defaulting your score to 0.')
+        setScore(0)
+      } finally {
+        setLoadingScore(false)
+      }
+    },
+    [username]
+  )
+
+  // Whenever we detect the wallet, kick off both username check + score fetch
+  useEffect(() => {
+    if (!ready) return
+
+    if (!authenticated || !user) {
+      setWalletAddress(null)
+      setUsername(null)
+      setHasUsername(null)
+      setNeedsProviderSetup(false)
+      setMessage(null)
+      setScore(null)
+      setSelectedCharacter('0')
+      setSelectedLevel('0')
+      return
+    }
+
+    const xapp = findCrossAppAccount()
+    if (!xapp) {
+      setWalletAddress(null)
+      setNeedsProviderSetup(false) // not linked yet; different CTA
+      setMessage('You need to link your Monad Games ID account to continue.')
+      setScore(null)
+      setSelectedCharacter('0')
+      setSelectedLevel('0')
+      return
+    }
+
+    const addr = xapp.embeddedWallets?.[0]?.address
+    if (addr) {
+      setNeedsProviderSetup(false)
+      setWalletAddress(addr)
+      checkWallet(addr)
+      fetchScoreForWallet(addr)
+    } else {
+      setWalletAddress(null)
+      setNeedsProviderSetup(true)
+      setMessage(
+        'No embedded wallet found on your linked Monad Games ID. Please use the links above to setup first the monad games account then retry linking the account.'
+      )
+      setScore(null)
+      setSelectedCharacter('0')
+      setSelectedLevel('0')
+    }
+  }, [ready, authenticated, user, findCrossAppAccount, checkWallet, fetchScoreForWallet])
+
+  // Provider setup flow
+  const openProviderSetup = () => {
+    window.open('https://monad-games-id-site.vercel.app/', '_blank', 'noopener')
+  }
+
+  const recheckAfterSetup = async () => {
+    await refreshUser().catch(() => {})
+    const x = findCrossAppAccount()
+    const addr = x?.embeddedWallets?.[0]?.address ?? null
+    if (addr) {
+      setNeedsProviderSetup(false)
+      setWalletAddress(addr)
+      setMessage('Wallet detected — thanks! Running username & score checks…')
+      checkWallet(addr)
+      fetchScoreForWallet(addr)
+    } else {
+      setMessage('Still no embedded wallet found. Please finish setup on Monad Games ID.')
+    }
+  }
+
+  const handleLink = async () => {
+    try {
+      await linkCrossAppAccount({ appId: providerAppId })
+      await refreshUser().catch(() => {})
+      setMessage('Linked! If the address is still blank, give it a moment or click Recheck.')
+    } catch {
+      setMessage('Linking canceled or failed.')
+    }
+  }
+
+  // Character unlock helpers
+  const isCharUnlocked = (key: CharacterKey) => {
+    const s = score ?? 0
+    return s >= CHAR_THRESHOLDS[key]
+  }
+  const remainingForChar = (key: CharacterKey) => {
+    const s = score ?? 0
+    const need = CHAR_THRESHOLDS[key] - s
+    return need > 0 ? need : 0
+  }
+
+  // Level unlock helpers
+  const isLevelUnlocked = (key: LevelKey) => {
+    const s = score ?? 0
+    return s >= LEVEL_THRESHOLDS[key]
+  }
+  const remainingForLevel = (key: LevelKey) => {
+    const s = score ?? 0
+    const need = LEVEL_THRESHOLDS[key] - s
+    return need > 0 ? need : 0
+  }
+
+  const handleSelectCharacter = (key: CharacterKey) => {
+    if (!isCharUnlocked(key)) {
+      const need = remainingForChar(key)
+      setMessage(
+        `"${CHAR_META[key].name}" is locked. Earn ${need} more point${need === 1 ? '' : 's'} to unlock.`
+      )
+      return
+    }
+    setSelectedCharacter(key)
+  }
+
+  const handleSelectLevel = (key: LevelKey) => {
+    if (!isLevelUnlocked(key)) {
+      const need = remainingForLevel(key)
+      setMessage(
+        `"${LEVEL_META[key].name}" is locked. Earn ${need} more point${need === 1 ? '' : 's'} to unlock.`
+      )
+      return
+    }
+    setSelectedLevel(key)
+  }
+
+  const handleContinue = () => {
+    if (!walletAddress || !username) {
+      setMessage('Please link your wallet and set a username first.')
+      return
+    }
+    if (!isCharUnlocked(selectedCharacter)) {
+      const need = remainingForChar(selectedCharacter)
+      setMessage(
+        `Selected character is locked. Earn ${need} more point${need === 1 ? '' : 's'} to unlock.`
+      )
+      return
+    }
+    if (!isLevelUnlocked(selectedLevel)) {
+      const need = remainingForLevel(selectedLevel)
+      setMessage(
+        `Selected level is locked. Earn ${need} more point${need === 1 ? '' : 's'} to unlock.`
+      )
+      return
+    }
+
+    const url = new URL(redirectBase)
+    const payload = {
+      walletAddress,
+      username,
+      character: String(selectedCharacter),
+      level: String(selectedLevel),
+    }
+    const token = base64url(JSON.stringify(payload))
+    url.searchParams.set('token', token)
+    window.location.href = url.toString()
+  }
+
+  if (!ready) return <p style={{ padding: 24, fontFamily: 'sans-serif' }}>Loading…</p>
+
+  return (
+    <div
+      style={{
+        fontFamily: 'sans-serif',
+        padding: 24,
+        lineHeight: 1.5,
+        color: '#ffffff',        // white text globally
+      }}
+    >
+      <h1>Survival Shooter: Revival</h1>
+      <p><b>How long will you survive the endless waves of zombies?</b></p>
+
+      {!authenticated ? (
+        <button onClick={login} style={{ color: '#ffffff' }}>Login</button>
+      ) : (
+        <button onClick={logout} style={{ color: '#ffffff' }}>Logout</button>
+      )}
+
+      {authenticated && (
+        <div style={{ marginTop: 16 }}>
+          <p>
+            <b>Cross-app (Monad Games) wallet:</b>{' '}
+            {walletAddress ?? '— not linked —'}
+          </p>
+
+          {!walletAddress && (
+            <p>
+              <b>
+                When you are prompted in the pop-up window. <br />
+                Please make sure the emails and accounts are matched.
+              </b>
+            </p>
+          )}
+
+          {/* Not linked yet -> show link button */}
+          {!walletAddress && (
+            <button onClick={handleLink} style={{ color: '#ffffff' }}>
+              Link Monad Games ID
+            </button>
+          )}
+
+          {/* Linked but no embedded wallet — ask them to go to provider */}
+          {needsProviderSetup && (
+            <div style={{ display: 'flex', gap: 12, alignItems: 'center', marginTop: 8 }}>
+              <button onClick={openProviderSetup} style={{ color: '#ffffff' }}>Open Monad Games ID</button>
+              <button onClick={recheckAfterSetup} style={{ color: '#ffffff' }}>I’ve set it up — Recheck</button>
+            </div>
+          )}
+
+          {/* Username + score actions */}
+          {walletAddress && (
+            <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
+              <button
+                onClick={() => checkWallet(walletAddress)}
+                disabled={checking}
+                style={{ color: '#ffffff' }}
+              >
+                {checking ? 'Checking…' : 'Re-check username'}
+              </button>
+              <button
+                onClick={() => walletAddress && fetchScoreForWallet(walletAddress)}
+                disabled={loadingScore}
+                style={{ color: '#ffffff' }}
+              >
+                {loadingScore ? 'Refreshing score…' : 'Refresh score'}
+              </button>
+              <button onClick={openProviderSetup} style={{ color: '#ffffff' }}>
+                Set / update username
+              </button>
+            </div>
+          )}
+
+          {/* Your current score */}
+          {walletAddress && (
+            <p style={{ marginTop: 12 }}>
+              <b>Your score:</b>{' '}
+              {loadingScore ? 'Loading…' : (score ?? 0)}
+              {scoreError ? (
+                <span style={{ color: 'crimson', marginLeft: 8 }}>({scoreError})</span>
+              ) : null}
+            </p>
+          )}
+
+          {message && <p style={{ marginTop: 12 }}>{message}</p>}
+
+          {/* Character selection */}
+          {walletAddress && (
+            <div style={{ marginTop: 24 }}>
+              <h2>Choose your character</h2>
+              <div
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))',
+                  gap: 16,
+                  marginTop: 8,
+                }}
+              >
+                {(Object.keys(CHAR_META) as CharacterKey[]).map((key) => {
+                  const meta = CHAR_META[key]
+                  const unlocked = isCharUnlocked(key)
+                  const selected = selectedCharacter === key
+                  const need = remainingForChar(key)
+
+                  return (
+                    <div
+                      key={key}
+                      style={{
+                        border: selected ? '2px solid #0f172a' : '1px solid #e2e8f0',
+                        borderRadius: 12,
+                        padding: 12,
+                        background: selected ? '#f8fafc' : '#ffffff',
+                        color: '#0f172a',
+                        opacity: unlocked ? 1 : 0.7,
+                      }}
+                    >
+                      <img
+                        src={meta.img}
+                        alt={meta.name}
+                        style={{
+                          width: '100%',
+                          height: 160,
+                          objectFit: 'cover',
+                          borderRadius: 8,
+                          marginBottom: 8,
+                        }}
+                      />
+
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                        <div>
+                          <div style={{ fontWeight: 700, color: '#0f172a' }}>{meta.name}</div>
+                          <div style={{ fontSize: 12, color: '#475569' }}>
+                            Unlocks at {CHAR_THRESHOLDS[key]} pts
+                            {!unlocked && <> — need {need} more</>}
+                          </div>
+                        </div>
+
+                        <input
+                          type="radio"
+                          name="character"
+                          value={key}
+                          checked={selected}
+                          onChange={() => handleSelectCharacter(key)}
+                          disabled={!unlocked}
+                          title={!unlocked ? `Need ${need} more points to unlock` : 'Select'}
+                        />
+                      </div>
+
+                      <p style={{ marginTop: 8, fontSize: 14, color: '#334155' }}>
+                        {meta.desc}
+                      </p>
+
+                      <button
+                        onClick={() => handleSelectCharacter(key)}
+                        disabled={!unlocked}
+                        style={{ marginTop: 8 }}
+                        title={!unlocked ? `Need ${need} more points to unlock` : 'Select'}
+                      >
+                        {selected ? 'Selected' : unlocked ? 'Select' : 'Locked'}
+                      </button>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Level selection */}
+          {walletAddress && (
+            <div style={{ marginTop: 24 }}>
+              <h2>Choose your level</h2>
+              <div
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))',
+                  gap: 16,
+                  marginTop: 8,
+                }}
+              >
+                {(Object.keys(LEVEL_META) as LevelKey[]).map((key) => {
+                  const meta = LEVEL_META[key]
+                  const unlocked = isLevelUnlocked(key)
+                  const selected = selectedLevel === key
+                  const need = remainingForLevel(key)
+
+                  return (
+                    <div
+                      key={key}
+                      style={{
+                        border: selected ? '2px solid #0f172a' : '1px solid #e2e8f0',
+                        borderRadius: 12,
+                        padding: 12,
+                        background: selected ? '#f8fafc' : '#ffffff',
+                        color: '#0f172a',
+                        opacity: unlocked ? 1 : 0.7,
+                      }}
+                    >
+                      <img
+                        src={meta.img}
+                        alt={meta.name}
+                        style={{
+                          width: '100%',
+                          height: 160,
+                          objectFit: 'cover',
+                          borderRadius: 8,
+                          marginBottom: 8,
+                        }}
+                      />
+
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                        <div>
+                          <div style={{ fontWeight: 700, color: '#0f172a' }}>{meta.name}</div>
+                          <div style={{ fontSize: 12, color: '#475569' }}>
+                            Unlocks at {LEVEL_THRESHOLDS[key]} pts
+                            {!unlocked && <> — need {need} more</>}
+                          </div>
+                        </div>
+
+                        <input
+                          type="radio"
+                          name="level"
+                          value={key}
+                          checked={selected}
+                          onChange={() => handleSelectLevel(key)}
+                          disabled={!unlocked}
+                          title={!unlocked ? `Need ${need} more points to unlock` : 'Select'}
+                        />
+                      </div>
+
+                      <p style={{ marginTop: 8, fontSize: 14, color: '#334155' }}>
+                        {meta.desc}
+                      </p>
+
+                      <button
+                        onClick={() => handleSelectLevel(key)}
+                        disabled={!unlocked}
+                        style={{ marginTop: 8 }}
+                        title={!unlocked ? `Need ${need} more points to unlock` : 'Select'}
+                      >
+                        {selected ? 'Selected' : unlocked ? 'Select' : 'Locked'}
+                      </button>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+
+          {hasUsername && username && walletAddress && (
+            <div style={{ marginTop: 12 }}>
+              <button onClick={handleContinue} style={{ color: '#ffffff' }}>
+                Continue to app with wallet, username, character & level
+              </button>
+            </div>
+          )}
+
+          <p style={{ marginTop: 24 }}>
+            This game is an entry for Monad Mission 7. Brought to you by{' '}
+            <a href="https://www.linkedin.com/in/mlesterdampios/">sh3n</a>
+          </p>
+          <p>
+            Base assets belong to{' '}
+            <a href="https://learn.unity.com/project/survival-shooter-tutorial">
+              Unity Learn
+            </a>. However, due to being old (2014), the tutorial was taken down as a lot of legacy
+            code inside it isn’t compatible with the current version. I rebooted the project,
+            updated to Unity 2022.3.62f1 LTS and added brand new features!
+          </p>
+          <h2>Credits</h2>
+          <ul>
+            <li>
+              <a href="https://learn.unity.com/project/survival-shooter-tutorial">Unity Learn</a>
+            </li>
+            <li>
+              <a href="https://www.linkedin.com/in/mlesterdampios/">sh3n (Myself)</a>
+            </li>
+            <li>
+              <a href="https://assetstore.unity.com/packages/3d/characters/quarter-view-3d-action-assets-pack-188720">
+                Quarter View 3D Action Assets Pack
+              </a>
+            </li>
+            <li>
+              <a href="https://assetstore.unity.com/packages/audio/sound-fx/sci-fi-guns-sfx-pack-181144">
+                Sci-fi Guns SFX Pack
+              </a>
+            </li>
+            <li>
+              <a href="https://quaternius.com/packs/cutemonsters.html">Cute Animated Monsters Pack</a>
+            </li>
+            <li>
+              <a href="https://assetstore.unity.com/packages/tools/utilities/virtual-joystick-pack-261317">Virtual Joystick Pack</a>
+            </li>
+            <li>
+              <a href="https://assetstore.unity.com/packages/3d/environments/landscapes/low-poly-atmospheric-locations-pack-278928">
+                Low Poly Atmospheric Locations Pack
+              </a>
+            </li>
+            <li>
+              <a href="https://quaternius.com/packs/ultimatemonsters.html">
+                Ultimate Monsters
+              </a>
+            </li>
+          </ul>
+        </div>
+      )}
+    </div>
+  )
+}

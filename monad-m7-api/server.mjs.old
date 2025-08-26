@@ -1,0 +1,477 @@
+import 'dotenv/config';
+import express from 'express';
+import cors from 'cors';
+import helmet from 'helmet';
+import { ethers } from 'ethers';
+import crypto from 'node:crypto';
+
+const {
+  RPC_URL,
+  PRIVATE_KEY,
+  CONTRACT_ADDRESS,
+  PORT = 3000,
+  NODE_ENV = 'production',
+  DEBUG = 'false',
+
+  // Anti-cheat tunables
+  SCORE_WINDOW_MS = '60000',
+  SCORE_PER_MIN_LIMIT = '10000',
+  MIN_SCORE_EVENT = '10',
+  MAX_SCORE_EVENT = '500',
+
+  // Queue/tx tunables
+  TX_CONFIRMATIONS = '1',          // wait for this many confirmations
+  TX_TIMEOUT_MS = '120000',        // timeout waiting for receipt (ms)
+} = process.env;
+
+const IS_DEBUG = String(DEBUG).toLowerCase() === 'true' || DEBUG === '1';
+const WINDOW_MS = Number(SCORE_WINDOW_MS);
+const LIMIT_PER_WINDOW = Number(SCORE_PER_MIN_LIMIT);
+const EVENT_MIN = Number(MIN_SCORE_EVENT);
+const EVENT_MAX = Number(MAX_SCORE_EVENT);
+const CONFIRMATIONS = Number(TX_CONFIRMATIONS);
+const TIMEOUT_MS = Number(TX_TIMEOUT_MS);
+
+const log = (...a) => console.log(new Date().toISOString(), ...a);
+const dlog = (...a) => IS_DEBUG && log('[DEBUG]', ...a);
+
+if (!RPC_URL || !PRIVATE_KEY || !CONTRACT_ADDRESS) {
+  console.error('Missing env vars. Please set RPC_URL, PRIVATE_KEY, CONTRACT_ADDRESS.');
+  process.exit(1);
+}
+
+const app = express();
+app.set('trust proxy', true);
+app.use(helmet());
+app.use(cors({ origin: true }));
+app.use(express.json({ limit: '1mb' }));
+
+// Request logger
+app.use((req, res, next) => {
+  const reqId = crypto.randomUUID();
+  req.id = reqId;
+  log(`[REQ ${reqId}] ${req.method} ${req.originalUrl} ip=${req.ip}`);
+  dlog(`[REQ ${reqId}] headers=`, {
+    'user-agent': req.get('user-agent'),
+    origin: req.get('origin'),
+    referer: req.get('referer'),
+    'content-type': req.get('content-type'),
+  });
+  const t0 = Date.now();
+  res.on('finish', () => log(`[RES ${reqId}] ${res.statusCode} ${req.method} ${req.originalUrl} (${Date.now()-t0}ms)`));
+  next();
+});
+
+// Ethers setup
+const provider = new ethers.JsonRpcProvider(RPC_URL);
+const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
+const ABI = [
+  {
+    inputs: [
+      { internalType: 'address', name: 'player', type: 'address' },
+      { internalType: 'uint256', name: 'scoreAmount', type: 'uint256' },
+      { internalType: 'uint256', name: 'transactionAmount', type: 'uint256' }
+    ],
+    name: 'updatePlayerData',
+    outputs: [],
+    stateMutability: 'nonpayable',
+    type: 'function'
+  },
+  { inputs: [], name: 'GAME_ROLE', outputs: [{ internalType: 'bytes32', name: '', type: 'bytes32' }], stateMutability: 'view', type: 'function' },
+  {
+    inputs: [
+      { internalType: 'bytes32', name: 'role', type: 'bytes32' },
+      { internalType: 'address', name: 'account', type: 'address' }
+    ],
+    name: 'hasRole',
+    outputs: [{ internalType: 'bool', name: '', type: 'bool' }],
+    stateMutability: 'view',
+    type: 'function'
+  }
+];
+const contract = new ethers.Contract(CONTRACT_ADDRESS, ABI, wallet);
+
+// Boot logs
+(async () => {
+  try {
+    const net = await provider.getNetwork();
+    log(`[BOOT] chainId=${net.chainId} signer=${wallet.address}`);
+  } catch (e) {
+    log('[BOOT] network query failed:', e?.shortMessage || e?.message || e);
+  }
+  try {
+    const role = await contract.GAME_ROLE();
+    const has = await contract.hasRole(role, wallet.address);
+    log(has
+      ? `[BOOT] signer ${wallet.address} has GAME_ROLE`
+      : `[BOOT] WARNING: signer ${wallet.address} lacks GAME_ROLE (txs may revert)`);
+  } catch (e) {
+    log('[BOOT] GAME_ROLE check failed:', e?.shortMessage || e?.message || e);
+  }
+})();
+
+// ---------- Anti-cheat sliding window ----------
+const windows = new Map(); // address -> { q: Array<{ts:number, score:number}>, sum:number }
+function getWin(addr) {
+  let w = windows.get(addr);
+  if (!w) { w = { q: [], sum: 0 }; windows.set(addr, w); }
+  return w;
+}
+function purgeOld(w, now) {
+  while (w.q.length && (now - w.q[0].ts) > WINDOW_MS) {
+    const e = w.q.shift();
+    w.sum -= e.score;
+  }
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [addr, w] of windows.entries()) {
+    purgeOld(w, now);
+    if (w.q.length === 0 && w.sum === 0) windows.delete(addr);
+  }
+}, Math.min(30_000, WINDOW_MS)).unref();
+
+// ---------- Transaction queue (serializes tx submissions) ----------
+let last = Promise.resolve();     // tail of the chain
+let qsize = 0;
+
+function enqueueTx(work, reqIdLabel = '') {
+  qsize++;
+  const id = reqIdLabel || crypto.randomUUID().slice(0, 8);
+  dlog(`[QUEUE] +1 (size=${qsize}) id=${id}`);
+
+  let resolveOuter, rejectOuter;
+  const p = new Promise((resolve, reject) => { resolveOuter = resolve; rejectOuter = reject; });
+
+  const run = async () => {
+    try {
+      const result = await work();
+      resolveOuter(result);
+    } catch (e) {
+      rejectOuter(e);
+    } finally {
+      qsize--;
+      dlog(`[QUEUE] -1 (size=${qsize}) id=${id}`);
+    }
+  };
+
+  // Chain the work after the previous job (on both success and failure)
+  last = last.then(run, run);
+  return p;
+}
+
+async function waitForReceiptWithTimeout(tx, confirmations, timeoutMs) {
+  const waitP = tx.wait(confirmations);
+  if (!timeoutMs || timeoutMs <= 0) return waitP;
+  return Promise.race([
+    waitP,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('TX_WAIT_TIMEOUT')), timeoutMs)
+    ),
+  ]);
+}
+
+// ---------- Routes ----------
+app.get('/health', async (_req, res) => {
+  try {
+    const [net, blockNum] = await Promise.all([provider.getNetwork(), provider.getBlockNumber()]);
+    res.json({
+      status: 'ok',
+      network: { chainId: net.chainId },
+      blockNumber: blockNum,
+      signer: wallet.address,
+      queueSize: qsize,
+      windowMs: WINDOW_MS,
+      perMinuteLimit: LIMIT_PER_WINDOW,
+      eventRange: [EVENT_MIN, EVENT_MAX],
+      confirmations: CONFIRMATIONS,
+      timeoutMs: TIMEOUT_MS
+    });
+  } catch (e) {
+    res.json({ status: 'degraded', error: e?.message || String(e) });
+  }
+});
+
+/**
+ * POST /api/v1/submitscore
+ * Body: { walletAddress: string, score: number }
+ * Calls: updatePlayerData(walletAddress, score, 1) — queued & serialized
+ */
+app.post('/api/v1/submitscore', async (req, res) => {
+  const reqId = req.id;
+
+  try {
+    dlog(`[REQ ${reqId}] body=`, req.body);
+    const { walletAddress, score } = req.body ?? {};
+
+    // Validate inputs
+    if (typeof walletAddress !== 'string') {
+      return res.status(400).json({ error: '`walletAddress` must be a string' });
+    }
+    if (!ethers.isAddress(walletAddress)) {
+      return res.status(400).json({ error: '`walletAddress` is not a valid EVM address' });
+    }
+    const parsedScore =
+      typeof score === 'string' ? Number(score) :
+      typeof score === 'number' ? score : NaN;
+    if (!Number.isFinite(parsedScore) || !Number.isInteger(parsedScore) || parsedScore < 0) {
+      return res.status(400).json({ error: '`score` must be a non-negative integer' });
+    }
+
+    // Per-event sanity (anti-cheat)
+    if (parsedScore < EVENT_MIN || parsedScore > EVENT_MAX) {
+      log(`[CHEAT ${reqId}] event score out of range addr=${walletAddress} score=${parsedScore} allowed=[${EVENT_MIN},${EVENT_MAX}]`);
+      return res.status(403).json({
+        ok: false,
+        code: 'SUSPECTED_SCORE_HACKING',
+        reason: `Per-event score must be between ${EVENT_MIN} and ${EVENT_MAX}.`,
+      });
+    }
+
+    // Sliding window anti-cheat at admission time
+    const now = Date.now();
+    const w = getWin(walletAddress.toLowerCase());
+    purgeOld(w, now);
+    const projected = w.sum + parsedScore;
+    if (projected > LIMIT_PER_WINDOW) {
+      log(`[CHEAT ${reqId}] minute cap exceeded addr=${walletAddress} sum=${w.sum} + ${parsedScore} > limit=${LIMIT_PER_WINDOW}`);
+      return res.status(403).json({
+        ok: false,
+        code: 'SUSPECTED_SCORE_HACKING',
+        reason: `Score cap exceeded: ${w.sum}+${parsedScore} in the last ${Math.round(WINDOW_MS/1000)}s (limit ${LIMIT_PER_WINDOW}).`,
+        window: { used: w.sum, incoming: parsedScore, limit: LIMIT_PER_WINDOW, seconds: Math.round(WINDOW_MS/1000) }
+      });
+    }
+
+    // Tentatively reserve in the window (rolled back on failure)
+    const entry = { ts: now, score: parsedScore };
+    w.q.push(entry);
+    w.sum += parsedScore;
+
+    // Enqueue the tx so nonces are serialized
+    const result = await enqueueTx(async () => {
+      // Diagnostics
+      try {
+        const gasEstimate = await contract.updatePlayerData.estimateGas(walletAddress, BigInt(parsedScore), 1n);
+        const nonce = await provider.getTransactionCount(wallet.address, 'pending');
+        const feeData = await provider.getFeeData();
+        dlog(`[${reqId}] Prepared call`, {
+          walletAddress,
+          score: parsedScore,
+          window: { used: w.sum - parsedScore, incoming: parsedScore, limit: LIMIT_PER_WINDOW },
+          txCountPending: nonce,
+          gasEstimate: gasEstimate?.toString?.(),
+          feeData: {
+            gasPrice: feeData?.gasPrice?.toString?.(),
+            maxFeePerGas: feeData?.maxFeePerGas?.toString?.(),
+            maxPriorityFeePerGas: feeData?.maxPriorityFeePerGas?.toString?.()
+          }
+        });
+      } catch (e) {
+        dlog(`[${reqId}] Gas/nonce/fee introspection failed:`, e?.shortMessage || e?.message || e);
+      }
+
+      // Send transaction (nonce will be correct because we serialize)
+      const tx = await contract.updatePlayerData(walletAddress, BigInt(parsedScore), 1n);
+      log(`[TX  ${reqId}] submitted hash=${tx.hash} nonce=${tx.nonce}`);
+
+      // Wait for receipt with timeout & confirmations
+      const receipt = await waitForReceiptWithTimeout(tx, CONFIRMATIONS, TIMEOUT_MS);
+      log(`[RCPT ${reqId}] status=${receipt.status} block=${receipt.blockNumber} gasUsed=${receipt.gasUsed?.toString?.()}`);
+      return { tx, receipt };
+    }, reqId);
+
+    // Success
+    const { tx, receipt } = result;
+    return res.json({
+      ok: true,
+      txHash: tx.hash,
+      blockNumber: receipt.blockNumber,
+      status: receipt.status,
+      gasUsed: receipt.gasUsed?.toString?.(),
+      to: receipt.to,
+      from: receipt.from,
+      nonce: tx.nonce,
+      queueSize: qsize,
+      window: { used: w.sum, limit: LIMIT_PER_WINDOW, seconds: Math.round(WINDOW_MS/1000) }
+    });
+
+  } catch (err) {
+    // Roll back the tentative reservation on failure
+    try {
+      const addr = (req.body?.walletAddress || '').toLowerCase();
+      const s = Number(req.body?.score);
+      const w = windows.get(addr);
+      if (w && Number.isFinite(s)) {
+        for (let i = w.q.length - 1; i >= 0; i--) {
+          if (w.q[i].score === s) { w.sum -= w.q[i].score; w.q.splice(i, 1); break; }
+        }
+      }
+    } catch { /* ignore rollback errors */ }
+
+    const code = err?.code || err?.info?.error?.code;
+    const reason = err?.shortMessage || err?.reason || err?.info?.error?.message || err?.message;
+    log(`[ERR ${req.id}]`, code || '', reason || err);
+
+    const http = (reason === 'TX_WAIT_TIMEOUT') ? 504 : 500;
+    return res.status(http).json({
+      ok: false,
+      error: 'Transaction failed',
+      code,
+      reason
+    });
+  }
+});
+
+
+// ========= GET LEADERBOARD EXTERNALLY =========
+
+// ---------- Leaderboard scraper (robust) ----------
+const LEADERBOARD_BASE = process.env.LEADERBOARD_BASE || 'https://monad-games-id-site.vercel.app/leaderboard';
+const LB_CACHE_MS = Number(process.env.LEADERBOARD_CACHE_MS || 15000);
+
+// Use global fetch when present (Node 18+), else fall back to node-fetch
+let _fetch = globalThis.fetch;
+if (!_fetch) {
+  const mod = await import('node-fetch'); // npm i node-fetch if needed
+  _fetch = mod.default;
+}
+
+let lbCache = new Map(); // key = gameId -> { ts, data }
+
+/**
+ * Find and parse strings from: self.__next_f.push([1,"<STRING>"])
+ * Then from the decoded string like `7:["$","$L13",null,{...}]`, grab the array's 4th element (object).
+ */
+function extractLeaderboardFromHtml(html, wantedGameId, reqId = '') {
+  const rePush = /self\.__next_f\.push\(\[1,"((?:\\.|[^"\\])*)"\]\)/g;
+  let match;
+  let pushes = 0;
+  let hits = 0;
+
+  while ((match = rePush.exec(html)) !== null) {
+    pushes++;
+    const captured = match[1];                  // the inner quoted payload WITHOUT the quotes
+    let decoded;
+    try {
+      // Re-wrap in quotes so JSON.parse will properly unescape it
+      decoded = JSON.parse(`"${captured}"`);    // e.g. '7:["$","$L13",null,{...}]'
+    } catch {
+      continue;
+    }
+
+    // Expect a "<number>:[...]" prefix
+    const colon = decoded.indexOf(':');
+    if (colon === -1) continue;
+    const arrJson = decoded.slice(colon + 1);   // the [...] JSON
+
+    let arr;
+    try {
+      arr = JSON.parse(arrJson);
+    } catch {
+      continue;
+    }
+    if (!Array.isArray(arr) || arr.length < 4 || typeof arr[3] !== 'object' || arr[3] === null) continue;
+
+    const payload = arr[3];
+    // Determine if this payload contains our gameId (at root or in arrays)
+    const rootGameId = payload.gameId ?? null;
+    const scoreHasWanted = Array.isArray(payload.scoreData) && payload.scoreData.some(x => Number(x.gameId) === Number(wantedGameId));
+    const txHasWanted = Array.isArray(payload.transactionData) && payload.transactionData.some(x => Number(x.gameId) === Number(wantedGameId));
+
+    if (Number(rootGameId) === Number(wantedGameId) || scoreHasWanted || txHasWanted) {
+      hits++;
+
+      const normScore = (payload.scoreData || [])
+        .filter(x => Number(x.gameId) === Number(wantedGameId))
+        .map(({ userId, username, walletAddress, score, gameId, gameName, rank }) => ({
+          userId, username, walletAddress, score, gameId: Number(gameId), gameName, rank: Number(rank)
+        }))
+        .sort((a,b) => a.rank - b.rank);
+
+      const normTx = (payload.transactionData || [])
+        .filter(x => Number(x.gameId) === Number(wantedGameId))
+        .map(({ userId, username, walletAddress, transactionCount, gameId, gameName, rank }) => ({
+          userId, username, walletAddress, transactionCount, gameId: Number(gameId), gameName, rank: Number(rank)
+        }))
+        .sort((a,b) => a.rank - b.rank);
+
+      dlog(`[LB ${reqId}] pushes=${pushes} matched=${hits} (gameId=${wantedGameId})`);
+      return {
+        ok: true,
+        gameId: Number(wantedGameId),
+        gameName: normScore[0]?.gameName || normTx[0]?.gameName || payload.gameName || null,
+        lastUpdated: payload.lastUpdated || null,
+        scorePagination: payload.scorePagination || null,
+        transactionPagination: payload.transactionPagination || null,
+        scoreData: normScore,
+        transactionData: normTx
+      };
+    }
+  }
+
+  dlog(`[LB ${reqId}] pushes scanned=${pushes}, no payload matched gameId=${wantedGameId}`);
+  return { ok: false, error: 'PAYLOAD_NOT_FOUND_FOR_GAME' };
+}
+
+/**
+ * GET /api/v1/getleaderboard?gameId=64
+ */
+app.get('/api/v1/getleaderboard', async (req, res) => {
+  const reqId = req.id;
+  const gameId = Number(req.query.gameId || 64);
+
+  try {
+    // Cache
+    const cached = lbCache.get(gameId);
+    if (cached && (Date.now() - cached.ts) < LB_CACHE_MS) {
+      dlog(`[LB ${reqId}] cache hit for gameId=${gameId}`);
+      return res.json({ ...cached.data, cached: true, cacheMs: LB_CACHE_MS });
+    }
+
+    const url = new URL(LEADERBOARD_BASE);
+    url.searchParams.set('gameId', String(gameId));
+
+    dlog(`[LB ${reqId}] fetching ${url.toString()}`);
+    const resp = await _fetch(url.toString(), {
+      method: 'GET',
+      headers: {
+        'User-Agent': 'score-middleware/1.0',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+      }
+    });
+
+    const html = await resp.text();
+    if (!resp.ok || !html) {
+      log(`[LB ${reqId}] upstream status=${resp.status}`);
+      return res.status(502).json({ ok: false, error: 'UPSTREAM_ERROR', status: resp.status });
+    }
+
+    const parsed = extractLeaderboardFromHtml(html, gameId, reqId);
+    if (!parsed.ok) {
+      log(`[LB ${reqId}] parse failed: ${parsed.error}`);
+      return res.status(500).json({ ok: false, error: parsed.error });
+    }
+
+    const result = {
+      ...parsed,
+      source: { url: url.toString(), fetchedAt: new Date().toISOString() }
+    };
+
+    lbCache.set(gameId, { ts: Date.now(), data: result });
+
+    return res.json(result);
+
+  } catch (e) {
+    const reason = e?.message || String(e);
+    log(`[ERR ${reqId}] leaderboard error: ${reason}`);
+    return res.status(500).json({ ok: false, error: 'INTERNAL_ERROR', reason });
+  }
+});
+
+// ========= END =========
+
+app.listen(Number(PORT), () => {
+  log(`[score-middleware] Listening on http://localhost:${PORT} (${NODE_ENV}) debug=${IS_DEBUG}`);
+  log(`[anti-cheat] window=${Math.round(WINDOW_MS/1000)}s limit=${LIMIT_PER_WINDOW}/window event=[${EVENT_MIN},${EVENT_MAX}]`);
+});

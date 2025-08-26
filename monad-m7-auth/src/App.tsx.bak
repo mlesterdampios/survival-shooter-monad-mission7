@@ -1,0 +1,241 @@
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import {
+  usePrivy,
+  useCrossAppAccounts,
+  useUser,
+  type CrossAppAccountWithMetadata,
+} from '@privy-io/react-auth'
+
+type CheckWalletResponse = {
+  hasUsername: boolean
+  user?: { id: number; username: string; walletAddress: string }
+}
+
+export default function App() {
+  const { ready, authenticated, user, login, logout } = usePrivy()
+  const { linkCrossAppAccount } = useCrossAppAccounts()
+  const { refreshUser } = useUser() // 👈 NEW
+
+  // ⚠️ This must be the *provider* app’s Privy App ID (Monad Games ID), not your consumer app.
+  const providerAppId = useMemo(
+    () =>
+      (import.meta.env.VITE_PROVIDER_APP_ID as string | undefined) ??
+      'cmd8euall0037le0my79qpz42',
+    []
+  )
+
+  const redirectBase = useMemo(
+    () => (import.meta.env.VITE_REDIRECT_BASE as string | undefined) ?? 'https://monad-mission7.rxmsolutions.com',
+    []
+  )
+
+  const [walletAddress, setWalletAddress] = useState<string | null>(null)
+  const [username, setUsername] = useState<string | null>(null)
+  const [hasUsername, setHasUsername] = useState<boolean | null>(null)
+  const [message, setMessage] = useState<string | null>(null)
+  const [checking, setChecking] = useState(false)
+  const [needsProviderSetup, setNeedsProviderSetup] = useState(false) // 👈 NEW
+
+  const findCrossAppAccount = useCallback(() => {
+    const xapp = (user?.linkedAccounts ?? []).find(
+      (a): a is CrossAppAccountWithMetadata =>
+        a.type === 'cross_app' && a.providerApp?.id === providerAppId
+    )
+    return xapp
+  }, [user, providerAppId])
+
+  const checkWallet = useCallback(async (addr: string) => {
+    setChecking(true)
+    setMessage('Checking wallet…')
+    try {
+      const res = await fetch(
+        `https://monad-games-id-site.vercel.app/api/check-wallet?wallet=${encodeURIComponent(
+          addr
+        )}`
+      )
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const data: CheckWalletResponse = await res.json()
+
+      setHasUsername(!!data.hasUsername)
+      if (data.hasUsername && data.user?.username) {
+        setUsername(data.user.username)
+        setMessage(`Welcome, ${data.user.username}!`)
+      } else {
+        setUsername(null)
+        setMessage('No username yet. Set one on Monad Games ID, then click “Re-check username.”')
+      }
+    } catch {
+      setMessage('Failed to check wallet. Please try again.')
+    } finally {
+      setChecking(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!ready) return
+
+    if (!authenticated || !user) {
+      setWalletAddress(null)
+      setUsername(null)
+      setHasUsername(null)
+      setNeedsProviderSetup(false) // 👈 reset
+      setMessage(null)
+      return
+    }
+
+    const xapp = findCrossAppAccount()
+    if (!xapp) {
+      setWalletAddress(null)
+      setNeedsProviderSetup(false) // 👈 not linked yet; different CTA
+      setMessage('You need to link your Monad Games ID account to continue.')
+      return
+    }
+
+    const addr = xapp.embeddedWallets?.[0]?.address
+    if (addr) {
+      setNeedsProviderSetup(false)
+      setWalletAddress(addr)
+      checkWallet(addr)
+    } else {
+      // 👇 EXACTLY your requested behavior
+      setWalletAddress(null)
+      setNeedsProviderSetup(true)
+      setMessage('No embedded wallet found on your linked Monad Games ID. Please use the links above to setup first the monad games account then retry linking the account.')
+    }
+  }, [ready, authenticated, user, findCrossAppAccount, checkWallet])
+
+  // 👇 NEW: handlers for provider setup flow
+  const openProviderSetup = () => {
+    window.open('https://monad-games-id-site.vercel.app/', '_blank', 'noopener')
+  }
+
+  const recheckAfterSetup = async () => {
+    // refresh the Privy user so linkedAccounts/embeddedWallets are up to date
+    await refreshUser().catch(() => {})
+    const x = findCrossAppAccount()
+    const addr = x?.embeddedWallets?.[0]?.address ?? null
+    if (addr) {
+      setNeedsProviderSetup(false)
+      setWalletAddress(addr)
+      setMessage('Wallet detected — thanks! Running username check…')
+      checkWallet(addr)
+    } else {
+      setMessage('Still no embedded wallet found. Please finish setup on Monad Games ID.')
+    }
+  }
+
+  const handleLink = async () => {
+    try {
+      await linkCrossAppAccount({ appId: providerAppId })
+      await refreshUser().catch(() => {})
+      setMessage('Linked! If the address is still blank, give it a moment or click Recheck.')
+    } catch {
+      setMessage('Linking canceled or failed.')
+    }
+  }
+
+  const handleContinue = () => {
+    if (!walletAddress || !username) return
+    const url = new URL(redirectBase)
+
+    const payload = { walletAddress, username };
+    const json = JSON.stringify(payload);
+
+    const base64url = (str) =>
+    btoa(unescape(encodeURIComponent(str)))  // base64
+    .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+
+    const token = base64url(json);
+
+    url.searchParams.set("token", token);
+
+    window.location.href = url.toString()
+  }
+
+  if (!ready) return <p style={{ padding: 24, fontFamily: 'sans-serif' }}>Loading…</p>
+
+  return (
+    <div style={{ fontFamily: 'sans-serif', padding: 24, lineHeight: 1.5 }}>
+      <h1>Survival Shooter: Revival</h1>
+      <p>
+        <b>How long will you survive the endless waves of zombies?</b>
+      </p>
+
+      {!authenticated ? (
+        <button onClick={login}>Login</button>
+      ) : (
+        <button onClick={logout}>Logout</button>
+      )}
+
+      {authenticated && (
+        <div style={{ marginTop: 16 }}>
+          <p>
+            <b>Cross-app (Monad Games) wallet:</b>{' '}
+            {walletAddress ?? '— not linked —'}
+          </p>
+
+          {!walletAddress && (
+            <p>
+              <b>When you are prompted in the pop-up window. <br/>
+              Please make sure the emails and accounts are matched.</b>
+            </p>
+          )}
+
+          {/* Not linked yet -> show link button */}
+          {!walletAddress && (
+            <button onClick={handleLink}>Link Monad Games ID</button>
+          )}
+
+          {/* 👇 NEW: Cross-app is linked but no embedded wallet — ask them to go to provider */}
+          {needsProviderSetup && (
+            <div style={{ display: 'flex', gap: 12, alignItems: 'center', marginTop: 8 }}>
+              <button onClick={openProviderSetup}>Open Monad Games ID</button>
+              <button onClick={recheckAfterSetup}>I’ve set it up — Recheck</button>
+              <a
+                href="https://monad-games-id-site.vercel.app/"
+                target="_blank"
+                rel="noreferrer"
+              >
+                (or click here)
+              </a>
+            </div>
+          )}
+
+          {/* Existing username flow shown once a wallet exists */}
+          {walletAddress && (
+            <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
+              <button onClick={() => checkWallet(walletAddress)} disabled={checking}>
+                {checking ? 'Checking…' : 'Re-check username'}
+              </button>
+              <a
+                href="https://monad-games-id-site.vercel.app/"
+                target="_blank"
+                rel="noreferrer"
+              >
+                Set / update username
+              </a>
+            </div>
+          )}
+
+          {message && <p style={{ marginTop: 12 }}>{message}</p>}
+
+          {hasUsername && username && (
+            <div style={{ marginTop: 12 }}>
+              <button onClick={handleContinue}>
+                Continue to app with wallet & username
+              </button>
+            </div>
+          )}
+
+          <p>
+            This game is an entry for Monad Mission 7. Brought to you by <a href="https://www.linkedin.com/in/mlesterdampios/">sh3n</a>
+          </p>
+          <p>
+            All assets belongs to <a href="https://learn.unity.com/project/survival-shooter-tutorial">Unity Learn</a>. However, due to being old (2014), the tutorial was taken down as lot of legacy code inside of it are not compatible anymore with the current version. I rebooted the project and updated to the latest unity version (2022.3.62f1 LTS).
+          </p>
+          
+        </div>
+      )}
+    </div>
+  )
+}

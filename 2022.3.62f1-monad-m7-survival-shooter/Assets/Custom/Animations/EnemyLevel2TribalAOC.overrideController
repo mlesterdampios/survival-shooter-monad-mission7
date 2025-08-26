@@ -1,0 +1,19 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!221 &22100000
+AnimatorOverrideController:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_Name: EnemyLevel2TribalAOC
+  m_Controller: {fileID: 9100000, guid: 4f5659a744a013141b51e373da66cd65, type: 2}
+  m_Clips:
+  - m_OriginalClip: {fileID: -4592842328519117816, guid: 0dc9813cb8ccbd647bf0eb1e51524da3, type: 3}
+    m_OverrideClip: {fileID: -4592842328519117816, guid: 518c1f1325a71174980777a4a38d0468, type: 3}
+  - m_OriginalClip: {fileID: 9061338213343248790, guid: 0dc9813cb8ccbd647bf0eb1e51524da3, type: 3}
+    m_OverrideClip: {fileID: 9061338213343248790, guid: 518c1f1325a71174980777a4a38d0468, type: 3}
+  - m_OriginalClip: {fileID: 4447012609936615250, guid: 0dc9813cb8ccbd647bf0eb1e51524da3, type: 3}
+    m_OverrideClip: {fileID: 4447012609936615250, guid: 518c1f1325a71174980777a4a38d0468, type: 3}
+  - m_OriginalClip: {fileID: -5599002979973759676, guid: 0dc9813cb8ccbd647bf0eb1e51524da3, type: 3}
+    m_OverrideClip: {fileID: -5599002979973759676, guid: 518c1f1325a71174980777a4a38d0468, type: 3}
